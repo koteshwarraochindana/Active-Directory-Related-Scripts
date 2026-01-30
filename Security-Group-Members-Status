@@ -1,0 +1,122 @@
+# ===============================
+# Export Active / Deactive Users from AD Security Group (Traditional PowerShell)
+# ===============================
+
+# --- SETTINGS ---
+# Put the group name here (SAMAccountName is best), or CN / DistinguishedName
+$SecurityGroup = "MSAZURE_PROD_AVD_WIN11_CA_SC1"
+
+# Output files
+$OutputCsv  = "C:\Users\U579652\Downloads\share\SecurityGroup_UserStatus_Report.csv"
+$ErrorLog   = "C:\Users\U579652\Downloads\share\SecurityGroup_UserStatus_Errors.log"
+
+# --- START ---
+Clear-Host
+Write-Host "Starting AD group user status export..." -ForegroundColor Cyan
+Write-Host "Group: $SecurityGroup" -ForegroundColor Yellow
+
+# Prompt for credentials (optional but matches your style)
+$Credential = Get-Credential -Message "Enter your Active Directory credentials"
+
+# Ensure AD module is available
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+catch {
+    Write-Host "ERROR: ActiveDirectory module not found. Install RSAT tools and try again." -ForegroundColor Red
+    throw
+}
+
+# Initialize error log
+"[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script started" | Out-File -FilePath $ErrorLog -Encoding UTF8
+
+# Resolve the group (helps when multiple groups have similar names)
+try {
+    $groupObj = Get-ADGroup -Identity $SecurityGroup -Credential $Credential -ErrorAction Stop
+}
+catch {
+    $msg = "ERROR: Unable to find group '$SecurityGroup'. Details: $($_.Exception.Message)"
+    Write-Host $msg -ForegroundColor Red
+    $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+Write-Host "Resolved Group DN: $($groupObj.DistinguishedName)" -ForegroundColor Green
+
+# Get all group members (recursive expands nested groups)
+Write-Host "Fetching members (including nested groups)..." -ForegroundColor Cyan
+try {
+    $members = Get-ADGroupMember -Identity $groupObj.DistinguishedName -Recursive -Credential $Credential -ErrorAction Stop
+}
+catch {
+    $msg = "ERROR: Failed to get group members. Details: $($_.Exception.Message)"
+    Write-Host $msg -ForegroundColor Red
+    $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+# Filter only user objects
+$userMembers = $members | Where-Object { $_.objectClass -eq "user" }
+
+if (-not $userMembers -or $userMembers.Count -eq 0) {
+    Write-Host "No user objects found in group membership." -ForegroundColor Yellow
+    "No user objects found in group membership." | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+Write-Host "Total user objects found: $($userMembers.Count)" -ForegroundColor Green
+
+# Collect user details
+Write-Host "Collecting user attributes (Enabled/LastLogonDate/etc.)..." -ForegroundColor Cyan
+
+$report = New-Object System.Collections.Generic.List[object]
+
+foreach ($m in $userMembers) {
+    try {
+        # Use DistinguishedName for reliability
+        $u = Get-ADUser -Identity $m.DistinguishedName -Credential $Credential `
+            -Properties DisplayName, SamAccountName, UserPrincipalName, Mail, Enabled, LastLogonDate, DistinguishedName `
+            -ErrorAction Stop
+
+        $status = if ($u.Enabled -eq $true) { "Active" } else { "Deactive" }
+
+        $report.Add([pscustomobject]@{
+            DisplayName        = $u.DisplayName
+            SamAccountName     = $u.SamAccountName
+            UserPrincipalName  = $u.UserPrincipalName
+            Mail               = $u.Mail
+            Enabled            = $u.Enabled
+            Status             = $status
+            LastLogonDate      = $u.LastLogonDate
+            DistinguishedName  = $u.DistinguishedName
+        })
+    }
+    catch {
+        $err = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed user lookup for '$($m.Name)' ($($m.DistinguishedName)). Error: $($_.Exception.Message)"
+        Write-Host $err -ForegroundColor DarkYellow
+        $err | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+        continue
+    }
+}
+
+# Export results
+if ($report.Count -gt 0) {
+    $report |
+        Sort-Object DisplayName |
+        Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+
+    $activeCount   = ($report | Where-Object { $_.Status -eq "Active" }).Count
+    $deactiveCount = ($report | Where-Object { $_.Status -eq "Deactive" }).Count
+
+    Write-Host "`nExport completed successfully!" -ForegroundColor Green
+    Write-Host "CSV: $OutputCsv" -ForegroundColor Green
+    Write-Host "Total Users  : $($report.Count)" -ForegroundColor Cyan
+    Write-Host "Active Users : $activeCount" -ForegroundColor Green
+    Write-Host "Deactive Users: $deactiveCount" -ForegroundColor Magenta
+    Write-Host "Error Log    : $ErrorLog" -ForegroundColor Yellow
+}
+else {
+    Write-Host "No user records were collected. Check the error log: $ErrorLog" -ForegroundColor Yellow
+}
+
+Write-Host "`nDone." -ForegroundColor Cyan
