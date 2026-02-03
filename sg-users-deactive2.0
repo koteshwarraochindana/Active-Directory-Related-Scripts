@@ -1,0 +1,220 @@
+# ===============================
+# FINAL: Export ONLY Deactive Users from ALL Security Groups in an OU + Per-Group Summary
+# READ-ONLY: No AD objects are modified/deleted.
+# ===============================
+
+# --- SETTINGS (EDIT THESE) ---
+$GroupsOU = "OU=SecurityGroups,DC=contoso,DC=com"   # <-- PUT YOUR OU DN HERE
+
+$OutputCsvDetails = "C:\Users\U579652\Downloads\share\OU_SecurityGroups_DeactiveUsers_Details.csv"
+$OutputCsvSummary = "C:\Users\U579652\Downloads\share\OU_SecurityGroups_Summary.csv"
+$ErrorLog         = "C:\Users\U579652\Downloads\share\OU_SecurityGroups_Errors.log"
+
+$Recursive = $true   # $true = include nested groups
+$IncludeDeactivatedApprox = $true  # Uses whenChanged for disabled users (approx disable date)
+
+# --- START ---
+Clear-Host
+Write-Host "Starting OU security groups export (ONLY Deactive users)..." -ForegroundColor Cyan
+Write-Host "OU Search Base: $GroupsOU" -ForegroundColor Yellow
+
+# Prompt for credentials (optional - matches your style)
+$Credential = Get-Credential -Message "Enter your Active Directory credentials"
+
+# Ensure AD module is available
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+catch {
+    Write-Host "ERROR: ActiveDirectory module not found. Install RSAT tools and try again." -ForegroundColor Red
+    throw
+}
+
+# Initialize error log
+"[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script started" | Out-File -FilePath $ErrorLog -Encoding UTF8
+
+# --- 1) Find all SECURITY-ENABLED groups under the OU (subtree) ---
+# groupType bit 2147483648 indicates "security enabled"
+Write-Host "Searching for security groups under OU (including sub-OUs)..." -ForegroundColor Cyan
+
+try {
+    $groups = Get-ADGroup -SearchBase $GroupsOU -SearchScope Subtree `
+        -LDAPFilter "(&(objectCategory=group)(groupType:1.2.840.113556.1.4.803:=2147483648))" `
+        -Properties DistinguishedName, Name `
+        -Credential $Credential -ErrorAction Stop
+}
+catch {
+    $msg = "ERROR: Failed to search for groups under '$GroupsOU'. Details: $($_.Exception.Message)"
+    Write-Host $msg -ForegroundColor Red
+    $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+if (-not $groups -or $groups.Count -eq 0) {
+    Write-Host "No security groups found under the specified OU." -ForegroundColor Yellow
+    "No security groups found under the specified OU." | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+Write-Host "Security groups found: $($groups.Count)" -ForegroundColor Green
+
+# --- 2) Prepare reports + caching ---
+$detailReport  = New-Object System.Collections.Generic.List[object]   # ONLY disabled users
+$summaryReport = New-Object System.Collections.Generic.List[object]   # per-group counts
+$userCache     = @{}  # DN -> ADUser object (prevents repeated lookups)
+
+# --- 3) Loop each group and collect users ---
+$groupIndex = 0
+
+foreach ($groupObj in $groups) {
+    $groupIndex++
+    Write-Host "`n[$groupIndex/$($groups.Count)] Processing Group: $($groupObj.Name)" -ForegroundColor Cyan
+
+    # Get members
+    try {
+        $members = if ($Recursive) {
+            Get-ADGroupMember -Identity $groupObj.DistinguishedName -Recursive `
+                -Credential $Credential -ErrorAction Stop
+        } else {
+            Get-ADGroupMember -Identity $groupObj.DistinguishedName `
+                -Credential $Credential -ErrorAction Stop
+        }
+    }
+    catch {
+        $msg = "ERROR: Failed to get members for group '$($groupObj.Name)'. Details: $($_.Exception.Message)"
+        Write-Host $msg -ForegroundColor DarkYellow
+        $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+
+        $summaryReport.Add([pscustomobject]@{
+            GroupName     = $groupObj.Name
+            GroupDN       = $groupObj.DistinguishedName
+            TotalUsers    = 0
+            ActiveUsers   = 0
+            DeactiveUsers = 0
+            DisabledPct   = 0
+            Notes         = "Failed to get members"
+        })
+        continue
+    }
+
+    # Filter users only
+    $userMembers = $members | Where-Object { $_.objectClass -eq "user" }
+
+    if (-not $userMembers -or $userMembers.Count -eq 0) {
+        Write-Host "No user objects found in this group." -ForegroundColor Yellow
+        $summaryReport.Add([pscustomobject]@{
+            GroupName     = $groupObj.Name
+            GroupDN       = $groupObj.DistinguishedName
+            TotalUsers    = 0
+            ActiveUsers   = 0
+            DeactiveUsers = 0
+            DisabledPct   = 0
+            Notes         = "No user members"
+        })
+        continue
+    }
+
+    # Per-group counters
+    $totalUsers    = 0
+    $activeUsers   = 0
+    $deactiveUsers = 0
+
+    foreach ($m in $userMembers) {
+        try {
+            $totalUsers++
+
+            # Cache user lookups
+            if (-not $userCache.ContainsKey($m.DistinguishedName)) {
+
+                $props = @(
+                    "DisplayName","SamAccountName","UserPrincipalName","Mail",
+                    "Enabled","LastLogonDate","DistinguishedName"
+                )
+
+                if ($IncludeDeactivatedApprox) { $props += "whenChanged" }
+
+                $u = Get-ADUser -Identity $m.DistinguishedName -Credential $Credential `
+                    -Properties $props -ErrorAction Stop
+
+                $userCache[$m.DistinguishedName] = $u
+            }
+            else {
+                $u = $userCache[$m.DistinguishedName]
+            }
+
+            if ($u.Enabled -eq $true) {
+                $activeUsers++
+                continue  # skip exporting active users -> keeps CSV small
+            }
+
+            # Disabled user path
+            $deactiveUsers++
+
+            # Approx "deactivated date" (AD does not store real disabled timestamp)
+            $deactivatedApprox = $null
+            if ($IncludeDeactivatedApprox) { $deactivatedApprox = $u.whenChanged }
+
+            # Add ONLY disabled users to detail report
+            $detailReport.Add([pscustomobject]@{
+                GroupName             = $groupObj.Name
+                GroupDN               = $groupObj.DistinguishedName
+                DisplayName           = $u.DisplayName
+                SamAccountName        = $u.SamAccountName
+                UserPrincipalName     = $u.UserPrincipalName
+                Mail                  = $u.Mail
+                Enabled               = $u.Enabled
+                Status                = "Deactive"
+                LastLogonDate         = $u.LastLogonDate
+                DeactivatedDateApprox = $deactivatedApprox
+                UserDN                = $u.DistinguishedName
+            })
+        }
+        catch {
+            $err = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed user lookup for '$($m.Name)' ($($m.DistinguishedName)) in group '$($groupObj.Name)'. Error: $($_.Exception.Message)"
+            Write-Host $err -ForegroundColor DarkYellow
+            $err | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+            continue
+        }
+    }
+
+    $disabledPct = if ($totalUsers -gt 0) { [math]::Round(($deactiveUsers / $totalUsers) * 100, 2) } else { 0 }
+
+    # Summary row per group
+    $summaryReport.Add([pscustomobject]@{
+        GroupName     = $groupObj.Name
+        GroupDN       = $groupObj.DistinguishedName
+        TotalUsers    = $totalUsers
+        ActiveUsers   = $activeUsers
+        DeactiveUsers = $deactiveUsers
+        DisabledPct   = $disabledPct
+        Notes         = ""
+    })
+
+    Write-Host "Group Totals -> Total: $totalUsers | Active: $activeUsers | Deactive: $deactiveUsers" -ForegroundColor Green
+}
+
+# --- 4) Export results ---
+try {
+    $summaryReport |
+        Sort-Object GroupName |
+        Export-Csv -Path $OutputCsvSummary -NoTypeInformation -Encoding UTF8
+
+    if ($detailReport.Count -gt 0) {
+        $detailReport |
+            Sort-Object GroupName, DisplayName |
+            Export-Csv -Path $OutputCsvDetails -NoTypeInformation -Encoding UTF8
+    }
+
+    Write-Host "`nExport completed!" -ForegroundColor Green
+    Write-Host "Summary CSV : $OutputCsvSummary" -ForegroundColor Green
+    Write-Host "Details CSV (ONLY Deactive users): $OutputCsvDetails" -ForegroundColor Green
+    Write-Host "Detail rows : $($detailReport.Count)" -ForegroundColor Cyan
+    Write-Host "Error Log   : $ErrorLog" -ForegroundColor Yellow
+}
+catch {
+    $msg = "ERROR: Export failed. Details: $($_.Exception.Message)"
+    Write-Host $msg -ForegroundColor Red
+    $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+}
+
+Write-Host "`nDone." -ForegroundColor Cyan
