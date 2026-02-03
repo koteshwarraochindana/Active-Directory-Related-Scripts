@@ -1,0 +1,175 @@
+# ===============================
+# Export Active / Deactive Users from ALL AD Security Groups in an OU
+# (Traditional PowerShell style + caching)
+# ===============================
+
+# --- SETTINGS ---
+# OU containing groups (Distinguished Name)
+$GroupsOU = "OU=SecurityGroups,DC=contoso,DC=com"   # <-- CHANGE THIS
+
+# Output files
+$OutputCsv  = "C:\Users\U579652\Downloads\share\OU_SecurityGroups_UserStatus_Report.csv"
+$ErrorLog   = "C:\Users\U579652\Downloads\share\OU_SecurityGroups_UserStatus_Errors.log"
+
+# Include nested group membership?
+$Recursive = $true
+
+# Include Deactivated date approximation (uses whenChanged when user is disabled)
+$IncludeDeactivatedApprox = $true
+
+# --- START ---
+Clear-Host
+Write-Host "Starting OU security groups user status export..." -ForegroundColor Cyan
+Write-Host "OU Search Base: $GroupsOU" -ForegroundColor Yellow
+
+# Prompt for credentials (optional but matches your style)
+$Credential = Get-Credential -Message "Enter your Active Directory credentials"
+
+# Ensure AD module is available
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+catch {
+    Write-Host "ERROR: ActiveDirectory module not found. Install RSAT tools and try again." -ForegroundColor Red
+    throw
+}
+
+# Initialize error log
+"[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script started" | Out-File -FilePath $ErrorLog -Encoding UTF8
+
+# --- 1) Find all SECURITY-ENABLED groups under the OU (subtree) ---
+# groupType bit 2147483648 indicates "security enabled"
+Write-Host "Searching for security groups under OU (including sub-OUs)..." -ForegroundColor Cyan
+
+try {
+    $groups = Get-ADGroup -SearchBase $GroupsOU -SearchScope Subtree `
+        -LDAPFilter "(&(objectCategory=group)(groupType:1.2.840.113556.1.4.803:=2147483648))" `
+        -Properties DistinguishedName, Name `
+        -Credential $Credential -ErrorAction Stop
+}
+catch {
+    $msg = "ERROR: Failed to search for groups under '$GroupsOU'. Details: $($_.Exception.Message)"
+    Write-Host $msg -ForegroundColor Red
+    $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+if (-not $groups -or $groups.Count -eq 0) {
+    Write-Host "No security groups found under the specified OU." -ForegroundColor Yellow
+    "No security groups found under the specified OU." | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+    return
+}
+
+Write-Host "Security groups found: $($groups.Count)" -ForegroundColor Green
+
+# --- 2) Prepare report + cache (avoid re-querying same user repeatedly) ---
+$report = New-Object System.Collections.Generic.List[object]
+$userCache = @{}   # key: user DN, value: ADUser object
+
+# --- 3) Loop each group and collect users ---
+$groupIndex = 0
+foreach ($groupObj in $groups) {
+    $groupIndex++
+    Write-Host "`n[$groupIndex/$($groups.Count)] Processing Group: $($groupObj.Name)" -ForegroundColor Cyan
+    Write-Host "DN: $($groupObj.DistinguishedName)" -ForegroundColor DarkCyan
+
+    # Get all group members (recursive expands nested groups)
+    try {
+        $members = if ($Recursive) {
+            Get-ADGroupMember -Identity $groupObj.DistinguishedName -Recursive `
+                -Credential $Credential -ErrorAction Stop
+        } else {
+            Get-ADGroupMember -Identity $groupObj.DistinguishedName `
+                -Credential $Credential -ErrorAction Stop
+        }
+    }
+    catch {
+        $msg = "ERROR: Failed to get members for group '$($groupObj.Name)'. Details: $($_.Exception.Message)"
+        Write-Host $msg -ForegroundColor DarkYellow
+        $msg | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+        continue
+    }
+
+    # Filter only user objects
+    $userMembers = $members | Where-Object { $_.objectClass -eq "user" }
+
+    if (-not $userMembers -or $userMembers.Count -eq 0) {
+        Write-Host "No user objects found in this group." -ForegroundColor Yellow
+        continue
+    }
+
+    Write-Host "User objects found in group: $($userMembers.Count)" -ForegroundColor Green
+
+    foreach ($m in $userMembers) {
+        try {
+            # Use cache to reduce AD queries
+            if (-not $userCache.ContainsKey($m.DistinguishedName)) {
+
+                $props = @(
+                    "DisplayName","SamAccountName","UserPrincipalName","Mail",
+                    "Enabled","LastLogonDate","DistinguishedName"
+                )
+
+                if ($IncludeDeactivatedApprox) { $props += "whenChanged" }
+
+                $u = Get-ADUser -Identity $m.DistinguishedName -Credential $Credential `
+                    -Properties $props -ErrorAction Stop
+
+                $userCache[$m.DistinguishedName] = $u
+            }
+            else {
+                $u = $userCache[$m.DistinguishedName]
+            }
+
+            $status = if ($u.Enabled -eq $true) { "Active" } else { "Deactive" }
+
+            # Approx deactivated date (only when disabled)
+            $deactivatedApprox = $null
+            if ($IncludeDeactivatedApprox -and $u.Enabled -eq $false) {
+                $deactivatedApprox = $u.whenChanged
+            }
+
+            $report.Add([pscustomobject]@{
+                GroupName             = $groupObj.Name
+                GroupDN               = $groupObj.DistinguishedName
+                DisplayName           = $u.DisplayName
+                SamAccountName        = $u.SamAccountName
+                UserPrincipalName     = $u.UserPrincipalName
+                Mail                  = $u.Mail
+                Enabled               = $u.Enabled
+                Status                = $status
+                LastLogonDate         = $u.LastLogonDate
+                DeactivatedDateApprox = $deactivatedApprox
+                UserDN                = $u.DistinguishedName
+            })
+        }
+        catch {
+            $err = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed user lookup for '$($m.Name)' ($($m.DistinguishedName)). Error: $($_.Exception.Message)"
+            Write-Host $err -ForegroundColor DarkYellow
+            $err | Out-File -FilePath $ErrorLog -Append -Encoding UTF8
+            continue
+        }
+    }
+}
+
+# --- 4) Export results ---
+if ($report.Count -gt 0) {
+    $report |
+        Sort-Object GroupName, DisplayName |
+        Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+
+    $activeCount   = ($report | Where-Object { $_.Status -eq "Active" }).Count
+    $deactiveCount = ($report | Where-Object { $_.Status -eq "Deactive" }).Count
+
+    Write-Host "`nExport completed successfully!" -ForegroundColor Green
+    Write-Host "CSV: $OutputCsv" -ForegroundColor Green
+    Write-Host "Total Rows   : $($report.Count) (users x group memberships)" -ForegroundColor Cyan
+    Write-Host "Active Rows  : $activeCount" -ForegroundColor Green
+    Write-Host "Deactive Rows: $deactiveCount" -ForegroundColor Magenta
+    Write-Host "Error Log    : $ErrorLog" -ForegroundColor Yellow
+}
+else {
+    Write-Host "No user records were collected. Check the error log: $ErrorLog" -ForegroundColor Yellow
+}
+
+Write-Host "`nDone." -ForegroundColor Cyan
