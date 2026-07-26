@@ -1,103 +1,65 @@
-Import-Module ActiveDirectory
+# Prerequisites: Run once in an administrative PowerShell prompt if not already installed:
+# Install-Module ImportExcel -Force -AllowClobber
 
-$users = Get-Content "C:\temp\users.txt"
+Import-Module ActiveDirectory
+Import-Module ImportExcel
+
+# Configuration Paths
+$userFile = "C:\temp\users.txt"
+$excelPath = "C:\temp\results.xlsx"
 $domains = @("adhcscint.net", "prd.hcscad.net")
 
+# Verify input file exists
+if (-not (Test-Path $userFile)) {
+    Write-Error "Input file not found at $userFile"
+    return
+}
+
+$users = Get-Content $userFile | Where-Object { $_ -match '\S' } # Cleans empty lines
 $results = @()
 
 foreach ($user in $users) {
-
-    $found = $null
-    $foundDomain = $null
-
+    # Check each domain independently without short-circuiting via 'break'
     foreach ($domain in $domains) {
+        $found = $null
         try {
-            $found = Get-ADUser -Server $domain -Identity $user -Properties Enabled, LastLogonDate, DistinguishedName -ErrorAction Stop
-            $foundDomain = $domain
-            break
+            # Use an explicit filter to match standard Identity fields, UserPrincipalNames, or email addresses
+            $found = Get-ADUser -Server $domain -Filter "SamAccountName -eq '$user' -or UserPrincipalName -eq '$user' -or mail -eq '$user'" -Properties Enabled, LastLogonDate, DistinguishedName -ErrorAction Stop
+        } catch {
+            # Catch connectivity or syntax errors silently to keep loop moving
         }
-        catch {}
-    }
-
-    if ($null -eq $found) {
-        $results += [PSCustomObject]@{
-            User              = $user
-            Domain            = "Not in AD"
-            Enabled           = "Not in AD"
-            LastLogonDate     = "N/A"
-            DistinguishedName = "N/A"
-        }
-    }
-    else {
-        $results += [PSCustomObject]@{
-            User              = $user
-            Domain            = $foundDomain
-            Enabled           = if ($found.Enabled) { "Enabled" } else { "Disabled" }
-            LastLogonDate     = $found.LastLogonDate
-            DistinguishedName = $found.DistinguishedName
-        }
-    }
-}
-
-$tab1 = $results | Where-Object { $_.Domain -eq "adhcscint.net" -or $_.Domain -eq "Not in AD" }
-$tab2 = $results | Where-Object { $_.Domain -eq "prd.hcscad.net" }
-
-$path = "C:\temp\results.xlsx"
-
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$wb = $excel.Workbooks.Add()
-
-# ✅ Delete extra default sheets safely (keep one)
-while ($wb.Sheets.Count -gt 1) {
-    $wb.Sheets.Item(1).Delete()
-}
-
-function Add-Sheet($wb, $name, $data) {
-
-    $ws = $wb.Sheets.Item(1)
-    $ws.Name = $name
-
-    $headers = $data[0].PSObject.Properties.Name
-
-    for ($i=0; $i -lt $headers.Count; $i++) {
-        $ws.Cells.Item(1, $i+1) = $headers[$i]
-    }
-
-    for ($r=0; $r -lt $data.Count; $r++) {
-        for ($c=0; $c -lt $headers.Count; $c++) {
-            $ws.Cells.Item($r+2, $c+1) = $data[$r].($headers[$c])
+        
+        if ($null -ne $found) {
+            $results += [PSCustomObject]@{
+                SearchInput       = $user
+                SAMAccountName    = $found.SamAccountName
+                Domain            = $domain
+                Status            = if ($found.Enabled) { "Enabled" } else { "Disabled" }
+                LastLogonDate     = if ($found.LastLogonDate) { $found.LastLogonDate.ToString() } else { "Never Logged On" }
+                DistinguishedName = $found.DistinguishedName
+            }
+        } else {
+            $results += [PSCustomObject]@{
+                SearchInput       = $user
+                SAMAccountName    = "N/A"
+                Domain            = "$domain (Not Found)"
+                Status            = "Absent"
+                LastLogonDate     = "N/A"
+                DistinguishedName = "N/A"
+            }
         }
     }
-
-    $ws.Columns.AutoFit() | Out-Null
 }
 
-# First sheet
-Add-Sheet $wb "adhcscint.net" $tab1
+# Split the master dataset safely by targeted domains
+$tab1 = $results | Where-Object { $_.Domain -eq "adhcscint.net" -or $_.Domain -eq "adhcscint.net (Not Found)" }
+$tab2 = $results | Where-Object { $_.Domain -eq "prd.hcscad.net" -or $_.Domain -eq "prd.hcscad.net (Not Found)" }
 
-# Add second sheet properly
-$ws2 = $wb.Sheets.Add()
-$ws2.Name = "prd.hcscad.net"
+# Remove older spreadsheet if it exists to overwrite cleanly
+if (Test-Path $excelPath) { Remove-Item $excelPath -Force }
 
-$headers = $tab2[0].PSObject.Properties.Name
+# Output data cleanly to individual multi-sheets
+$tab1 | Export-Excel -Path $excelPath -WorksheetName "adhcscint.net" -AutoSize
+$tab2 | Export-Excel -Path $excelPath -WorksheetName "prd.hcscad.net" -AutoSize
 
-for ($i=0; $i -lt $headers.Count; $i++) {
-    $ws2.Cells.Item(1, $i+1) = $headers[$i]
-}
-
-for ($r=0; $r -lt $tab2.Count; $r++) {
-    for ($c=0; $c -lt $headers.Count; $c++) {
-        $ws2.Cells.Item($r+2, $c+1) = $tab2[$r].($headers[$c])
-    }
-}
-
-$ws2.Columns.AutoFit() | Out-Null
-
-$wb.SaveAs($path)
-$wb.Close()
-$excel.Quit()
-
-[System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
-
-Write-Host "Saved to $path"
+Write-Host "Process completed successfully. Results saved to $excelPath" -ForegroundColor Green
