@@ -1,6 +1,3 @@
-# Prerequisites: Run once in an administrative PowerShell prompt if not already installed:
-# Install-Module ImportExcel -Force -AllowClobber
-
 Import-Module ActiveDirectory
 Import-Module ImportExcel
 
@@ -19,47 +16,55 @@ $users = Get-Content $userFile | Where-Object { $_ -match '\S' } # Cleans empty 
 $results = @()
 
 foreach ($user in $users) {
-    # Check each domain independently without short-circuiting via 'break'
+    $bestMatch = $null
+    $matchedDomain = "N/A"
+    
+    # Internal scan across all domains for the current user
     foreach ($domain in $domains) {
-        $found = $null
         try {
-            # Use an explicit filter to match standard Identity fields, UserPrincipalNames, or email addresses
             $found = Get-ADUser -Server $domain -Filter "SamAccountName -eq '$user' -or UserPrincipalName -eq '$user' -or mail -eq '$user'" -Properties Enabled, LastLogonDate, DistinguishedName -ErrorAction Stop
+            
+            if ($null -ne $found) {
+                # Prioritization Rules: 
+                # 1. If we haven't found anything yet, grab this record (even if disabled).
+                # 2. If we previously found a disabled record, but THIS domain has an ENABLED record, overwrite it.
+                if ($null -eq $bestMatch -or (-not $bestMatch.Enabled -and $found.Enabled)) {
+                    $bestMatch = $found
+                    $matchedDomain = $domain
+                }
+            }
         } catch {
-            # Catch connectivity or syntax errors silently to keep loop moving
+            # Safely skip offline domains or errors to keep processing the input list
         }
-        
-        if ($null -ne $found) {
-            $results += [PSCustomObject]@{
-                SearchInput       = $user
-                SAMAccountName    = $found.SamAccountName
-                Domain            = $domain
-                Status            = if ($found.Enabled) { "Enabled" } else { "Disabled" }
-                LastLogonDate     = if ($found.LastLogonDate) { $found.LastLogonDate.ToString() } else { "Never Logged On" }
-                DistinguishedName = $found.DistinguishedName
-            }
-        } else {
-            $results += [PSCustomObject]@{
-                SearchInput       = $user
-                SAMAccountName    = "N/A"
-                Domain            = "$domain (Not Found)"
-                Status            = "Absent"
-                LastLogonDate     = "N/A"
-                DistinguishedName = "N/A"
-            }
+    }
+    
+    # Output exactly ONE row per input user line
+    if ($null -ne $bestMatch) {
+        $results += [PSCustomObject]@{
+            "Search Input"       = $user
+            "SAM Account Name"   = $bestMatch.SamAccountName
+            "Target Domain"      = $matchedDomain
+            "AD Status"          = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
+            "Last Logon Date"    = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate.ToString() } else { "Never Logged On" }
+            "Distinguished Name" = $bestMatch.DistinguishedName
+        }
+    } else {
+        # Handles the "Not Found" scenario perfectly to preserve a 1-to-1 line count
+        $results += [PSCustomObject]@{
+            "Search Input"       = $user
+            "SAM Account Name"   = "N/A"
+            "Target Domain"      = "Not Found"
+            "AD Status"          = "Absent"
+            "Last Logon Date"    = "N/A"
+            "Distinguished Name" = "N/A"
         }
     }
 }
 
-# Split the master dataset safely by targeted domains
-$tab1 = $results | Where-Object { $_.Domain -eq "adhcscint.net" -or $_.Domain -eq "adhcscint.net (Not Found)" }
-$tab2 = $results | Where-Object { $_.Domain -eq "prd.hcscad.net" -or $_.Domain -eq "prd.hcscad.net (Not Found)" }
-
 # Remove older spreadsheet if it exists to overwrite cleanly
 if (Test-Path $excelPath) { Remove-Item $excelPath -Force }
 
-# Output data cleanly to individual multi-sheets
-$tab1 | Export-Excel -Path $excelPath -WorksheetName "adhcscint.net" -AutoSize
-$tab2 | Export-Excel -Path $excelPath -WorksheetName "prd.hcscad.net" -AutoSize
+# Export to a single sheet with automatically sized columns
+$results | Export-Excel -Path $excelPath -WorksheetName "AD Status Report" -AutoSize
 
-Write-Host "Process completed successfully. Results saved to $excelPath" -ForegroundColor Green
+Write-Host "Process completed successfully. Exactly $($results.Count) lines saved to $excelPath" -ForegroundColor Green
