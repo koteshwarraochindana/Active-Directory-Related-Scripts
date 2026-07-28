@@ -1,0 +1,92 @@
+Import-Module ActiveDirectory
+Import-Module ImportExcel
+
+# Configuration Paths
+$userFile = "C:\temp\users.txt"
+$excelPath = "C:\temp\results.xlsx"
+$domains = @("adhcscint.net", "prd.hcscad.net")
+
+# Verify input file exists
+if (-not (Test-Path $userFile)) {
+    Write-Error "Input file not found at $userFile"
+    return
+}
+
+# Cleans empty lines from input file
+$users = Get-Content $userFile | Where-Object { $_ -match '\S' }
+$totalUsers = $users.Count
+$results = @()
+$counter = 0
+
+foreach ($user in $users) {
+    $counter++
+    $cleanedUser = $user.Trim()
+    $bestMatch = $null
+    $matchedDomain = "N/A"
+
+    # Dynamic real-time progress status (1% to 100%)
+    $percentComplete = [math]::Round(($counter / $totalUsers) * 100)
+    Write-Progress -Activity "Processing Active Directory Records" -Status "Progress: $percentComplete%" -PercentComplete $percentComplete
+
+    # Construct smart search filters to handle hcsc.com, bcbsil.com, mydearborngroup.com, and careallies.com
+    if ($cleanedUser -like "*@*") {
+        # Extracts the prefix/ID before the @ sign (e.g., 'Darshan_Patel2')
+        $prefix = ($cleanedUser -split '@')[0]
+        
+        # Cross-checks the full text, raw ID, and standard UPN formats dynamically
+        $filter = "SamAccountName -eq '$cleanedUser' -or UserPrincipalName -eq '$cleanedUser' -or mail -eq '$cleanedUser' -or SamAccountName -eq '$prefix' -or UserPrincipalName -like '$prefix@*'"
+    } else {
+        # Regular fallback structure for raw IDs or specific user lookups
+        $filter = "SamAccountName -eq '$cleanedUser' -or UserPrincipalName -eq '$cleanedUser' -or mail -eq '$cleanedUser'"
+    }
+
+    # Search across all enterprise directory roots
+    foreach ($domain in $domains) {
+        try {
+            $found = Get-ADUser -Server $domain -Filter $filter -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName, mail -ErrorAction Stop
+            
+            if ($null -ne $found) {
+                # Prioritization Rules: Prefer active accounts over stale/disabled profiles
+                if ($null -eq $bestMatch -or (-not $bestMatch.Enabled -and $found.Enabled)) {
+                    $bestMatch = $found
+                    $matchedDomain = $domain
+                }
+            }
+        } catch {
+            # Safely bypass unreachable networks or temporary domain timeouts
+        }
+    }
+
+    # Output generation (Removed Search Input and AD Configured UPN for maximum speed)
+    if ($null -ne $bestMatch) {
+        $results += [PSCustomObject]@{
+            "Display Name"        = $bestMatch.DisplayName
+            "SAM Account Name"    = $bestMatch.SamAccountName
+            "AD Target Domain"    = $matchedDomain
+            "AD Registered Mail"  = $bestMatch.mail
+            "AD Account Status"   = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
+            "Last Logon Date"     = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate.ToString() } else { "Never Logged On" }
+            "Distinguished Name"  = $bestMatch.DistinguishedName
+        }
+    } else {
+        $results += [PSCustomObject]@{
+            "Display Name"        = "N/A"
+            "SAM Account Name"    = "N/A"
+            "AD Target Domain"    = "Not Found"
+            "AD Registered Mail"  = "N/A"
+            "AD Account Status"   = "Absent"
+            "Last Logon Date"     = "N/A"
+            "Distinguished Name"  = "N/A"
+        }
+    }
+}
+
+# Remove older spreadsheet if it exists to overwrite cleanly
+if (Test-Path $excelPath) {
+    Remove-Item $excelPath -Force
+}
+
+# Export to sheet with automatically sized columns
+$results | Export-Excel -Path $excelPath -WorksheetName "AD Status Report" -AutoSize
+
+Write-Host "Process completed successfully. Exactly $($results.Count) lines saved to $excelPath" -ForegroundColor Green
