@@ -28,45 +28,59 @@ foreach ($user in $users) {
     $percentComplete = [math]::Round(($counter / $totalUsers) * 100)
     Write-Progress -Activity "Processing Active Directory Records" -Status "Progress: $percentComplete%" -PercentComplete $percentComplete
 
-    # Search across all domains for the current user using your original multi-match logic
+    # Construct smart search filters to handle hcsc.com, bcbsil.com, mydearborngroup.com, and careallies.com
+    if ($cleanedUser -like "*@*") {
+        # Extracts the prefix/ID before the @ sign (e.g., 'Darshan_Patel2')
+        $prefix = ($cleanedUser -split '@')[0]
+        
+        # Cross-checks the full text, raw ID, and standard UPN formats dynamically
+        $filter = "SamAccountName -eq '$cleanedUser' -or UserPrincipalName -eq '$cleanedUser' -or mail -eq '$cleanedUser' -or SamAccountName -eq '$prefix' -or UserPrincipalName -like '$prefix@*'"
+    } else {
+        # Regular fallback structure for raw IDs or specific user lookups
+        $filter = "SamAccountName -eq '$cleanedUser' -or UserPrincipalName -eq '$cleanedUser' -or mail -eq '$cleanedUser'"
+    }
+
+    # Search across all enterprise directory roots
     foreach ($domain in $domains) {
         try {
-            # Optimized to ONLY request fields required for the final clean report
-            $found = Get-ADUser -Server $domain -Filter "SamAccountName -eq '$cleanedUser' -or UserPrincipalName -eq '$cleanedUser' -or mail -eq '$cleanedUser'" -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName -ErrorAction Stop
+            $found = Get-ADUser -Server $domain -Filter $filter -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName, UserPrincipalName, mail -ErrorAction Stop
             
             if ($null -ne $found) {
-                # Prioritization Rules (Your original working logic)
+                # Prioritization Rules: Prefer active accounts over stale/disabled profiles
                 if ($null -eq $bestMatch -or (-not $bestMatch.Enabled -and $found.Enabled)) {
                     $bestMatch = $found
                     $matchedDomain = $domain
                 }
             }
         } catch {
-            # Safely skip offline domains or errors to keep processing the input list
+            # Safely bypass unreachable subnets or temporary timeout errors
         }
     }
 
-    # Output exactly ONE row per input user line (Removed duplicate columns)
+    # Output generation (No duplicate columns, optimized for fast generation)
     if ($null -ne $bestMatch) {
         $results += [PSCustomObject]@{
-            "Search Input (Email/UPN)" = $cleanedUser
-            "Display Name"             = $bestMatch.DisplayName
-            "SAM Account Name"         = $bestMatch.SamAccountName
-            "Target Domain"            = $matchedDomain
-            "AD Status"                = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
-            "Last Logon Date"          = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate.ToString() } else { "Never Logged On" }
-            "Distinguished Name"       = $bestMatch.DistinguishedName
+            "Search Input (Provided)"   = $cleanedUser
+            "Display Name"              = $bestMatch.DisplayName
+            "SAM Account Name"          = $bestMatch.SamAccountName
+            "AD Target Domain"          = $matchedDomain
+            "AD Configured UPN"         = $bestMatch.UserPrincipalName
+            "AD Registered Mail"        = $bestMatch.mail
+            "AD Account Status"         = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
+            "Last Logon Date"           = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate.ToString() } else { "Never Logged On" }
+            "Distinguished Name"        = $bestMatch.DistinguishedName
         }
     } else {
-        # Handles the "Not Found" scenario perfectly to preserve a 1-to-1 line count
         $results += [PSCustomObject]@{
-            "Search Input (Email/UPN)" = $cleanedUser
-            "Display Name"             = "N/A"
-            "SAM Account Name"         = "N/A"
-            "Target Domain"            = "Not Found"
-            "AD Status"                = "Absent"
-            "Last Logon Date"          = "N/A"
-            "Distinguished Name"       = "N/A"
+            "Search Input (Provided)"   = $cleanedUser
+            "Display Name"              = "N/A"
+            "SAM Account Name"          = "N/A"
+            "AD Target Domain"          = "Not Found"
+            "AD Configured UPN"         = "N/A"
+            "AD Registered Mail"        = "N/A"
+            "AD Account Status"         = "Absent"
+            "Last Logon Date"           = "N/A"
+            "Distinguished Name"        = "N/A"
         }
     }
 }
@@ -76,7 +90,7 @@ if (Test-Path $excelPath) {
     Remove-Item $excelPath -Force
 }
 
-# Export to a single sheet with automatically sized columns
+# Export to sheet with automatically sized columns
 $results | Export-Excel -Path $excelPath -WorksheetName "AD Status Report" -AutoSize
 
 Write-Host "Process completed successfully. Exactly $($results.Count) lines saved to $excelPath" -ForegroundColor Green
