@@ -12,107 +12,71 @@ if (-not (Test-Path $userFile)) {
     return
 }
 
+# Cleans empty lines from input file
 $users = Get-Content $userFile | Where-Object { $_ -match '\S' }
+$totalUsers = $users.Count
 $results = @()
+$counter = 0
 
 foreach ($user in $users) {
-
-    $input = $user.Trim()
+    $counter++
+    $cleanedUser = $user.Trim()
     $bestMatch = $null
     $matchedDomain = "N/A"
-    $inputType = "Unknown"
 
-    # ----------------------------
-    # Auto-detect input type
-    # ----------------------------
-    if ($input -match "^[^@\s]+@[^@\s]+\.[^@\s]+$") {
-        $inputType = "Email"
-    }
-    elseif ($input -match "^[^@\s]+@[^@\s]+$") {
-        $inputType = "UPN"
-    }
-    else {
-        $inputType = "SamAccountName"
-    }
+    # Calculate and display real-time dynamic progress status (1% to 100%)
+    $percentComplete = [math]::Round(($counter / $totalUsers) * 100)
+    Write-Progress -Activity "Processing Active Directory Records" -Status "Progress: $percentComplete%" -PercentComplete $percentComplete
 
-    # ----------------------------
-    # Search across domains
-    # ----------------------------
+    # Search across all domains for the current user using your original multi-match logic
     foreach ($domain in $domains) {
         try {
-
-            switch ($inputType) {
-
-                "Email" {
-                    $found = Get-ADUser -Server $domain `
-                        -Filter "mail -eq '$input'" `
-                        -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName, Mail, UserPrincipalName `
-                        -ErrorAction Stop
-                }
-
-                "UPN" {
-                    $found = Get-ADUser -Server $domain `
-                        -Filter "UserPrincipalName -eq '$input'" `
-                        -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName, Mail, UserPrincipalName `
-                        -ErrorAction Stop
-                }
-
-                default {
-                    $found = Get-ADUser -Server $domain `
-                        -Filter "SamAccountName -eq '$input'" `
-                        -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName, Mail, UserPrincipalName `
-                        -ErrorAction Stop
-                }
-            }
-
-            if ($found) {
+            # Optimized to ONLY request fields required for the final clean report
+            $found = Get-ADUser -Server $domain -Filter "SamAccountName -eq '$cleanedUser' -or UserPrincipalName -eq '$cleanedUser' -or mail -eq '$cleanedUser'" -Properties Enabled, LastLogonDate, DistinguishedName, DisplayName -ErrorAction Stop
+            
+            if ($null -ne $found) {
+                # Prioritization Rules (Your original working logic)
                 if ($null -eq $bestMatch -or (-not $bestMatch.Enabled -and $found.Enabled)) {
                     $bestMatch = $found
                     $matchedDomain = $domain
                 }
             }
-        }
-        catch {
-            # Skip domain errors safely
+        } catch {
+            # Safely skip offline domains or errors to keep processing the input list
         }
     }
 
-    # ----------------------------
-    # Build output (one row per input)
-    # ----------------------------
+    # Output exactly ONE row per input user line (Removed duplicate columns)
     if ($null -ne $bestMatch) {
         $results += [PSCustomObject]@{
-            "Search Input"       = $input
-            "Input Type"         = $inputType
-            "Display Name"       = $bestMatch.DisplayName
-            "Email Address"      = $bestMatch.Mail
-            "UPN"                = $bestMatch.UserPrincipalName
-            "SAM Account Name"   = $bestMatch.SamAccountName
-            "Target Domain"      = $matchedDomain
-            "AD Status"          = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
-            "Last Logon Date"    = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate.ToString() } else { "Never Logged On" }
-            "Distinguished Name" = $bestMatch.DistinguishedName
+            "Search Input (Email/UPN)" = $cleanedUser
+            "Display Name"             = $bestMatch.DisplayName
+            "SAM Account Name"         = $bestMatch.SamAccountName
+            "Target Domain"            = $matchedDomain
+            "AD Status"                = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
+            "Last Logon Date"          = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate.ToString() } else { "Never Logged On" }
+            "Distinguished Name"       = $bestMatch.DistinguishedName
         }
-    }
-    else {
+    } else {
+        # Handles the "Not Found" scenario perfectly to preserve a 1-to-1 line count
         $results += [PSCustomObject]@{
-            "Search Input"       = $input
-            "Input Type"         = $inputType
-            "Display Name"       = "N/A"
-            "Email Address"      = "N/A"
-            "UPN"                = "N/A"
-            "SAM Account Name"   = "N/A"
-            "Target Domain"      = "Not Found"
-            "AD Status"          = "Absent"
-            "Last Logon Date"    = "N/A"
-            "Distinguished Name" = "N/A"
+            "Search Input (Email/UPN)" = $cleanedUser
+            "Display Name"             = "N/A"
+            "SAM Account Name"         = "N/A"
+            "Target Domain"            = "Not Found"
+            "AD Status"                = "Absent"
+            "Last Logon Date"          = "N/A"
+            "Distinguished Name"       = "N/A"
         }
     }
 }
 
-# Clean export
-if (Test-Path $excelPath) { Remove-Item $excelPath -Force }
+# Remove older spreadsheet if it exists to overwrite cleanly
+if (Test-Path $excelPath) {
+    Remove-Item $excelPath -Force
+}
 
+# Export to a single sheet with automatically sized columns
 $results | Export-Excel -Path $excelPath -WorksheetName "AD Status Report" -AutoSize
 
 Write-Host "Process completed successfully. Exactly $($results.Count) lines saved to $excelPath" -ForegroundColor Green
